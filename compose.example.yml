@@ -1,0 +1,58 @@
+# modelnorm-sidecar — sidecar 层部署示例（不含 new-api 本体）
+#
+# 本仓库只包含 sidecar（openresty + prober）。new-api / postgres / redis 为
+# 第三方开源项目（QuantumNous/new-api），请按官方文档自行部署，本示例不包含。
+#
+# 步骤：
+#   1. 部署 new-api（官方 compose 或已有实例），记下其 docker 网络名（docker network ls 查看，
+#      官方 compose 默认 <项目名>_default，如 newapi_default）
+#   2. cp .env.example .env，填 PROBER_TOKEN（new-api 的 sk- token）
+#   3. docker compose -f compose.example.yml build
+#   4. docker compose -f compose.example.yml up -d
+#   5. bash verify.sh   # 12/12 PASS 为部署完成
+#
+# 注意：openresty 的 upstream 写死为 new-api:3000 —— new-api 容器必须与本 sidecar
+# 在同一 docker 网络且容器名可解析（官方 compose 的容器名就是 new-api）。
+
+services:
+  openresty:
+    build: ./openresty
+    container_name: openresty
+    restart: always
+    ports:
+      - '3000:3000'
+    networks:
+      - sidecar
+    healthcheck:
+      test: ['CMD-SHELL', "wget -q -O - http://127.0.0.1:3000/api/status >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  prober:
+    build: ./prober
+    container_name: prober
+    restart: always
+    depends_on:
+      - openresty
+    environment:
+      - GATEWAY_URL=http://openresty:3000
+      - MODEL_LIST=/app/models.txt
+      - SLEEP=900
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-health-admin-token}
+      - TOKEN=${PROBER_TOKEN:-}
+    volumes:
+      - ./prober/models.txt:/app/models.txt:ro
+    networks:
+      - sidecar
+    healthcheck:
+      test: ['CMD-SHELL', "pgrep -f probe.sh >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# 挂到已有 new-api 部署的网络（把 name 改成第 1 步查到的实际网络名）
+networks:
+  sidecar:
+    name: newapi_default
+    external: true
