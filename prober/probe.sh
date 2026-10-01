@@ -12,7 +12,13 @@
 # 环境变量：
 #   GATEWAY_URL   默认 http://openresty:3000
 #   MODEL_LIST    默认 /app/models.txt
-#   SLEEP         轮次间隔秒数，默认 900（15 分钟）
+#   SLEEP         轮次间隔秒数，默认 7200（2 小时）+ 0~300s 随机抖动
+#   TRIGGER_FILE  手动触发哨兵文件，默认 /tmp/probe_now（存在即立刻跑一轮）
+#
+# 静默时段：本地 00:00-08:00 不探活（脚本内按 UTC>=16 判定）
+# 手动探活：
+#   立刻触发一轮（后台循环内）: docker exec prober touch /tmp/probe_now
+#   前台跑完一轮即退出:         docker exec prober /app/probe.sh --once
 #   ADMIN_TOKEN   默认 health-admin-token（需与 default.conf 一致）
 #   TOKEN         new-api 鉴权 token（必填）
 
@@ -20,10 +26,11 @@ set -eu
 
 GATEWAY_URL="${GATEWAY_URL:-http://openresty:3000}"
 MODEL_LIST="${MODEL_LIST:-/app/models.txt}"
-SLEEP="${SLEEP:-900}"
+SLEEP="${SLEEP:-7200}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-health-admin-token}"
 TOKEN="${TOKEN:-}"
 STATE_DIR="/tmp/probe_state"
+TRIGGER_FILE="${TRIGGER_FILE:-/tmp/probe_now}"   # 手动触发哨兵：touch 此文件即立刻跑一轮
 
 [ -z "$TOKEN" ] && { echo "FATAL: TOKEN env is required (new-api bearer token)" >&2; exit 1; }
 mkdir -p "$STATE_DIR"
@@ -34,13 +41,26 @@ state_key() { echo "$STATE_DIR/$(echo "$1" | md5sum | cut -d' ' -f1)"; }
 
 # 探活单个模型（超时 90s，上游链路慢是常态）
 # 返回: LIVE|DEAD|UNKNOWN
+# 探活提示词池：自然短句，避免短消息命中上游反测活关键词（如 "ping"）。
+# 输出控制：每个提示词都明确要求短输出（≤30字/单词），既拟真又省 token。
+PROBE_PROMPTS=(
+    "用一句话概括今天天气很好。"
+    "翻译：你好世界。"
+    "给我一个两个字的中文回复：在吗？"
+    "请回复：好。"
+    "把数字 1 翻译成中文。"
+    "请输出一个字：好。"
+    "简短问候：回我一句早安。"
+)
 probe_one() {
     local model="$1"
     local body rc=0
+    # 随机选一条提示词，让每轮探活流量看起来不一样
+    local prompt="${PROBE_PROMPTS[$RANDOM % ${#PROBE_PROMPTS[@]}]}"
     body=$(curl -s -m 90 -X POST "${GATEWAY_URL}/v1/chat/completions" \
         -H "Authorization: Bearer ${TOKEN}" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}") || rc=$?
+        -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}],\"max_tokens\":8}") || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "UNKNOWN"; return   # 超时/网络错误 ≠ 死
     fi
@@ -107,9 +127,52 @@ main() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Cycle complete. alive=$live dead=$dead unknown=$unknown"
 }
 
-# 主循环：每轮探活后 sleep SLEEP 秒
+# 主循环：
+#   - 静默时段（本地 00:00-08:00）不探活
+#   - 其余时间：跑一轮 → sleep SLEEP 秒（+0~300s 随机抖动）
+#   - 支持手动触发：docker exec prober touch /tmp/probe_now
+#   - 支持一次性：  docker exec prober /app/probe.sh --once
+
+# 静默时段判定：本地时间(UTC+8) 00:00-08:00 = UTC 16:00-23:59
+# （容器无 tzdata，直接用 UTC 小时判断；中国无夏令时，恒为 UTC+8）
+in_quiet_hours() {
+    local h
+    h=$(date -u +%H)
+    h=$((10#$h))
+    [ "$h" -ge 16 ]
+}
+
+# 可中断睡眠：每 20s 检查一次触发哨兵。返回 1 = 被手动触发
+sleep_interruptible() {
+    local secs="$1" elapsed=0
+    while [ "$elapsed" -lt "$secs" ]; do
+        if [ -f "$TRIGGER_FILE" ]; then
+            rm -f "$TRIGGER_FILE"
+            return 1
+        fi
+        sleep 20
+        elapsed=$((elapsed + 20))
+    done
+    return 0
+}
+
+# --once：立即跑一整轮后退出（手动探活，不进后台循环）
+if [ "${1:-}" = "--once" ]; then
+    main
+    exit 0
+fi
+
 while true; do
-    main "$@" || echo "WARN: cycle error, retrying next round"
-    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Sleeping ${SLEEP}s before next cycle..."
-    sleep "$SLEEP"
+    if in_quiet_hours; then
+        echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Quiet hours (local 00:00-08:00, UTC $(date -u +%H):xx) - skip probing; re-check in 600s..."
+        if sleep_interruptible 600; then continue; fi
+        echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Manual trigger during quiet hours - probing anyway."
+    fi
+
+    main || echo "WARN: cycle error, retrying next round"
+
+    local_jitter=$((RANDOM % 300))
+    local_sleep=$((SLEEP + local_jitter))
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Sleeping ${local_sleep}s (base ${SLEEP} + ${local_jitter}s jitter) before next cycle..."
+    sleep_interruptible "$local_sleep" || continue
 done

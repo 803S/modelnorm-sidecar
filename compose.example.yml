@@ -38,7 +38,7 @@ services:
     environment:
       - GATEWAY_URL=http://openresty:3000
       - MODEL_LIST=/app/models.txt
-      - SLEEP=900
+      - SLEEP=7200
       - ADMIN_TOKEN=${ADMIN_TOKEN:-health-admin-token}
       - TOKEN=${PROBER_TOKEN:-}
     volumes:
