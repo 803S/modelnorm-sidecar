@@ -12,7 +12,12 @@
 # 环境变量：
 #   GATEWAY_URL   默认 http://openresty:3000
 #   MODEL_LIST    默认 /app/models.txt
-#   SLEEP         轮次间隔秒数，默认 7200（2 小时）+ 0~300s 随机抖动
+#   SLEEP         轮次间隔秒数，默认 14400（4 小时）+ 0~900s 随机抖动
+#   PROBE_PAUSE   每个模型之间的基础间隔秒数，默认 2（+0~2s 抖动）
+#                 → 一轮 173 个约 6~10 分钟打完，速率约 0.3~0.5 req/s
+#                 目的：避免突发流量吃光上游并发额度导致用户侧 429
+#   BATCH_SIZE    每探测多少个模型长休一次，默认 25
+#   BATCH_PAUSE   长休秒数，默认 12（+0~15s 抖动）
 #   TRIGGER_FILE  手动触发哨兵文件，默认 /tmp/probe_now（存在即立刻跑一轮）
 #
 # 静默时段：本地 00:00-08:00 不探活（脚本内按 UTC>=16 判定）
@@ -26,8 +31,16 @@ set -eu
 
 GATEWAY_URL="${GATEWAY_URL:-http://openresty:3000}"
 MODEL_LIST="${MODEL_LIST:-/app/models.txt}"
-SLEEP="${SLEEP:-7200}"
-ADMIN_TOKEN="${ADMIN_TOKEN:-health-admin-token}"
+SLEEP="${SLEEP:-14400}"
+export ADMIN_TOKEN="${ADMIN_TOKEN:-health-admin-token}"
+
+# ---------------- 限速参数（防突发吃光上游并发 → 用户侧 429）----------------
+PROBE_PAUSE="${PROBE_PAUSE:-2}"
+BATCH_SIZE="${BATCH_SIZE:-25}"
+BATCH_PAUSE="${BATCH_PAUSE:-12}"
+# 被动优先模式：1=只主动探测盲区模型（默认），0=全量主动探活
+ONLY_BLIND="${ONLY_BLIND:-1}"
+PASSIVE_ENABLED="${PASSIVE_ENABLED:-1}"
 TOKEN="${TOKEN:-}"
 STATE_DIR="/tmp/probe_state"
 TRIGGER_FILE="${TRIGGER_FILE:-/tmp/probe_now}"   # 手动触发哨兵：touch 此文件即立刻跑一轮
@@ -100,13 +113,29 @@ main() {
     [ -f "$MODEL_LIST" ] || die "Model list not found: $MODEL_LIST"
     command -v curl >/dev/null 2>&1 || die "curl not found in container"
 
-    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting probe cycle (gateway=$GATEWAY_URL)"
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting cycle (gateway=$GATEWAY_URL)"
+
+    # ========== 阶段 1：被动健康检测（零请求，只读 new-api 日志）==========
+    local blind_file="/tmp/passive_state/blind_models.txt"
+    if [ "${PASSIVE_ENABLED:-1}" = "1" ] && [ -f /app/passive_health.py ]; then
+        echo "--- passive health scan (zero requests) ---"
+        python3 /app/passive_health.py 2>&1 | tail -6 || echo "WARN: passive scan failed, falling back to blind file if exists"
+    fi
+
+    # ========== 阶段 2：只对“被动盲区”做主动探测 ==========
+    local target_list="$MODEL_LIST"
+    if [ "${ONLY_BLIND:-1}" = "1" ] && [ -s "$blind_file" ]; then
+        target_list="$blind_file"
+        echo "--- active probe: ONLY blind-zone ($(wc -l < "$blind_file" | tr -d ' ') models) ---"
+    else
+        echo "--- active probe: FULL sweep (ONLY_BLIND=${ONLY_BLIND:-1}) ---"
+    fi
 
     local models=()
     while IFS= read -r line; do
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
         models+=("$line")
-    done < "$MODEL_LIST"
+    done < "$target_list"
 
     local total=${#models[@]}
     echo "Total models to probe: $total"
@@ -123,12 +152,22 @@ main() {
             *)       unknown=$((unknown+1));;
         esac
         echo "  [$idx/$total] $model -> $verdict/$status"
+
+        # ---- 限速：摊平突发，避免吃光上游并发额度导致用户侧 429 ----
+        # 每个模型间 2~4s；每 25 个再长休 12~27s，更像真人节奏
+        pause=$(( PROBE_PAUSE + RANDOM % (PROBE_PAUSE + 1) ))
+        sleep "$pause"
+        if [ "$idx" -lt "$total" ] && [ $((idx % BATCH_SIZE)) -eq 0 ]; then
+            long=$(( BATCH_PAUSE + RANDOM % 16 ))
+            echo "      ...batch rest ${long}s (rate limit)..."
+            sleep "$long"
+        fi
     done
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Cycle complete. alive=$live dead=$dead unknown=$unknown"
 }
 
 # 主循环：
-#   - 静默时段（本地 00:00-08:00）不探活
+# 静默时段判定：本地 00:00-08:00 不探活
 #   - 其余时间：跑一轮 → sleep SLEEP 秒（+0~300s 随机抖动）
 #   - 支持手动触发：docker exec prober touch /tmp/probe_now
 #   - 支持一次性：  docker exec prober /app/probe.sh --once
@@ -171,7 +210,7 @@ while true; do
 
     main || echo "WARN: cycle error, retrying next round"
 
-    local_jitter=$((RANDOM % 300))
+    local_jitter=$((RANDOM % 900))
     local_sleep=$((SLEEP + local_jitter))
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Sleeping ${local_sleep}s (base ${SLEEP} + ${local_jitter}s jitter) before next cycle..."
     sleep_interruptible "$local_sleep" || continue

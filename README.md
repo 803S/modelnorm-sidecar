@@ -12,7 +12,7 @@ NewAPI 聚合多个上游供应商后，`/v1/models` 会返回大量同名变体
 
 1. **归一化**：把同名变体折叠成一个名字（agent 零改动，base_url 指向 sidecar 即可）
 2. **合成名**：为没有干净名的上游模型造一个（如 `laguna-xs-2.1:free` → `laguna-xs-2.1`），请求时翻译回真名
-3. **探活过滤**：prober 容器每 2 小时探活全量模型（本地 00:00–08:00 静默不探），连续 2 轮明确报错才标 dead 从列表隐藏（fail-open：超时≠死，防误杀）
+3. **探活过滤**：死的模型从 `/v1/models` 列表里隐藏。判定以**读 new-api 日志为主（零请求）**，只对日志覆盖不到的少数模型做低频主动探测（fail-open：超时≠死，防误杀）
 
 ## 依托关系
 
@@ -26,9 +26,12 @@ agent (base_url = http://<host>:3000)        ← 零改动
 │   POST /v1/*     → 合成名翻译 → 透传 (SSE)    │
 │   /__modelnorm/health → 健康表管理端点        │
 ├──────────────────────────────────────────────┤
-│  prober 容器（每 2 小时，静默时段跳过）       │
-│   182 模型，自然短句探活（max_tokens=8）      │
-│   → PUT 健康表 → dead 自动隐藏                │
+│  prober 容器（每 4 小时一轮）                  │
+│   ├ 阶段1 被动：读 new-api 日志，零请求        │
+│   │         ~169/182 模型由此判定              │
+│   └ 阶段2 主动：只测日志盲区 ~13 个            │
+│        （限速 2~4s/个，约 40 秒跑完）          │
+│   → PUT 健康表 → dead 自动隐藏                 │
 └──────────────────┬───────────────────────────┘
                    │ 同一 docker 网络
                    ▼
@@ -48,7 +51,10 @@ new-api / postgres / redis 由其[官方 compose](https://github.com/QuantumNous
 | `openresty/Dockerfile` | OpenResty alpine 镜像 |
 | `openresty/default.conf` | 全部归一化 + 健康表逻辑（http 级指令 + Lua） |
 | `prober/Dockerfile` | 探活容器（alpine + curl + bash） |
-| `prober/probe.sh` | 探活主脚本（fail-open 判定；静默时段 / 手动触发哨兵 / `--once` 模式） |
+| `prober/probe.sh` | 主循环：阶段1 调被动检测，阶段2 只测盲区（含静默时段 / 手动触发哨兵 / `--once`） |
+| `prober/passive_health.py` | **被动检测器**：解析 new-api 日志判定存活，零请求；429 不当死模型 |
+| `probe-now.sh` | 手动触发探活（立刻触发一轮 / `--once` 前台跑 / `--status` 看健康表） |
+| `deploy-prober.sh` | 带自动回滚的部署脚本（6 步校验，失败自动还原旧镜像） |
 | `prober/models.txt` | 探活名单（必须覆盖上游全量列表，漏掉的名字永远不会隐藏） |
 | `probe-now.sh` | 手动触发探活（立刻触发一轮 / `--once` 前台跑 / `--status` 看健康表） |
 | `verify.sh` | 回归自检（fail-closed，12 项） |
@@ -89,31 +95,84 @@ agent 的 `base_url` 从 `http://<new-api>:3000` 改成 `http://<host>:3000`（�
 | 有 `"error"` 第 1 次 | suspect | 显示 |
 | 有 `"error"` 连续第 2 次 | **dead** | **隐藏** |
 | curl 超时/网络错误 | unknown | 显示（超时≠死） |
-| TTL 3 小时过期（10800s） | 条目消失 | 重新显示 |
+| TTL 8.5 小时过期（30600s） | 条目消失 | 重新显示 |
 
-**TTL 必须大于探针间隔（红线）**：部署值为 TTL=10800s(3h) vs 间隔=7200s(2h)+≤300s 抖动。
-曾因 TTL=2700s(45min) < 间隔 3600s 导致每小时有 15+ 分钟健康表全空 → 死模型周期性重现。
+**TTL 必须大于探针间隔（红线）**：部署值为 TTL=30600s(8.5h) vs 间隔=14400s(4h)+≤900s 抖动。
+曾因 TTL=2700s(45min) < 间隔 3600s，导致每小时有 15+ 分钟健康表全空 → 死模型周期性重现（列表一夜回到解放前）。
 
-## 探活节奏与防封（2026-09-28 调优）
+## 探活架构：被动优先（2026-10-07 重构）
 
-- **间隔**：2 小时 + 0~300s 随机抖动（防固定周期特征）；原 15 分钟 → 流量 10,900 → 约 1,500 请求/天（↓87%）
-- **静默时段**：本地 00:00–08:00 不探活（容器为 UTC 无 tzdata，脚本内按 `date -u +%H >= 16` 判定，中国无夏令时无需处理）
-- **提示词**：7 条自然短句随机选（如「请回复：好。」），`max_tokens=8`；严禁 `ping`/探针字样（曾致上游封渠道）
-- **手动触发**：
+**核心思路：能不看就不主动问。** new-api 每笔调用都打了日志，直接读日志判定即可，不必拿自己的额度和并发去试。
 
-```bash
-cd /Users/lihua-dis/Software/Docker_compose/NewAPI
-./probe-now.sh            # 立刻触发一轮（不打断后台循环，20s 内响应）
-./probe-now.sh --once     # 前台跑完一整轮看完整输出（约 10–20 分钟）
-./probe-now.sh --status   # 健康表统计（dead/suspect/unknown）
+### 阶段 1：被动检测（零请求）
 
-# 等价原生命令：
-docker exec prober touch /tmp/probe_now      # 哨兵触发
-docker exec prober /app/probe.sh --once      # 一次性前台跑
+`prober/passive_health.py` 解析 `docker logs new-api`，两类权威日志：
+
+```
+# 成功 → 最强 LIVE 证据
+record consume log: userId=1, params={...,"model_name":"hy4-preview",...}
+
+# 失败 → 【权威】直接含 modelName + status_code + 错误正文
+record error log: userId=1, channelId=7, modelName=glm-5.2, tokenName=...,
+  content=status_code=429, Concurrent request limit reached: the same user can run at most 3 model
 ```
 
-- **重建容器前必须备份判定状态**：`docker cp prober:/tmp/probe_state /tmp/probe_state_bak`，重建后立刻 `docker cp /tmp/probe_state_bak/. prober:/tmp/probe_state`——否则所有 dead 降级 suspect，要等 2 轮（约 4 小时）才恢复隐藏
-- **改 `probe.sh` 需重建镜像**（COPY 进镜像）；改 `default.conf` 只需 `docker cp` + `openresty -s reload`（热重载会清空 shared_dict，死模型短暂重现，下轮恢复）
+覆盖率：**182 个模型中 ~169 个（93%）** 能被日志判定，剩下 ~13 个（无人调用过的冷门模型）才需要主动兜底。
+
+### 坑：429 不是死模型（重要）
+
+上面的样例就是典型：**用户并发上限被打满**（同一用户最多 3 并发），模型本身活得好好的。
+若据此标 dead，等于自己把自己的模型判死。判定规则：
+
+| 证据 | 判定 |
+|---|---|
+| 窗口内有成功调用 | **LIVE**（哪怕同时也有失败） |
+| 只有 429 / 限额 / quota / `Concurrent request limit` / `at most` 类 | **不动**，绝不判死 |
+| 只有硬错误（400/401/403/404/410/500/502/503/504/522/524）且无成功 | 累计 ≥2 次才 **DEAD**（防抖） |
+| 超时 | UNKNOWN → 显示（fail-open） |
+
+### 阶段 2：主动兜底（只对盲区）
+
+被动扫完会生成 `/tmp/passive_state/blind_models.txt`，`probe.sh` 只读这个文件去探测（默认 `ONLY_BLIND=1`）。
+
+- **不是 ping**：7 条自然短句随机选，`max_tokens=8`
+  ```
+  用一句话概括今天天气很好。/ 翻译：你好世界。/ 请回复：好。/ 把数字 1 翻译成中文。…
+  ```
+- **限速**：每个模型间隔 `PROBE_PAUSE=2`(2~4s)，每 25 个长休 `BATCH_PAUSE=12`(12~27s)
+  → 一轮 13 个约 40 秒，**速率 ~0.3 req/s**，不会吃满上游并发导致用户侧 429
+- **静默时段**：本地 00:00–08:00 不探活（容器 alpine 无 tzdata，`TZ` 无效，脚本内按 `date -u +%H >= 16` 判定）
+
+### 效果
+
+| 指标 | 重构前 | 重构后 |
+|---|---|---|
+| 主动请求/轮 | 182 | **13** |
+| 一轮耗时 | 6–10 分钟突发 | **~40 秒** |
+| 每天请求量 | ~1092 | **~78（↓93%）** |
+
+### 手动触发
+
+```bash
+./probe-now.sh            # 立刻触发一轮（不打断后台循环）
+./probe-now.sh --once     # 前台跑完一轮看完整输出
+./probe-now.sh --status   # 健康表统计（dead/suspect/unknown）
+
+docker exec prober touch /tmp/probe_now      # 等价哨兵触发
+```
+
+### 部署（带自动回滚）
+
+改了 prober 后**必须重建容器**（代码是 COPY 进镜像的），用现成脚本：
+
+```bash
+bash deploy-prober.sh
+```
+
+6 步：前置检查 openresty 健康 → 备份镜像 → 备份 probe_state → 语法校验 → 构建重建 → 恢复 state + 断言新代码生效 + 断言链路仍通。
+任一步失败 `trap` 自动用备份镜像回滚，**prober 挂了不影响 openresty/new-api 链路**。
+
+> 注意：改 `default.conf` 不用重建，`docker cp` + `openresty -s reload` 即可（热重载会清空 shared_dict，死模型短暂重现，下轮恢复）。
 
 ## 设计红线
 
@@ -126,7 +185,7 @@ docker exec prober /app/probe.sh --once      # 一次性前台跑
 
 ## 踩坑索引
 
-完整踩坑记录（Lua 死循环事故、探活系统 H1–H9、TTL 耦合事故、防封调优）见笔记库：`hermes-notes/AI_notes/2026-09-20-NewAPI模型列表归一化sidecar.md`、`concepts/2026-09-21-newapi-路由机制与模型名映射边界.md`、`AI_notes/2026-09-28-NewAPI探活调优与健康表TTL坑.md`。
+完整踩坑记录（Lua 死循环事故、探活系统 H1–H9、TTL 耦合事故、防封调优、被动化重构）见笔记库：`hermes-notes/AI_notes/2026-09-20-NewAPI模型列表归一化sidecar.md`、`concepts/2026-09-21-newapi-路由机制与模型名映射边界.md`、`AI_notes/2026-09-28-NewAPI探活调优与健康表TTL坑.md`、`AI_notes/2026-10-07-探活被动化重构与429不当死模型.md`。
 
 高频坑速查：
 
@@ -141,7 +200,10 @@ docker exec prober /app/probe.sh --once      # 一次性前台跑
 - 合成名撞上游新真名 → verify.sh 会抓出，从 `MN_SYNTH_REWRITE` 删该条（真名优先）
 - 健康表 TTL 必须 > 探针间隔（TTL ≥ 2×(间隔+抖动)），否则每轮之间条目过期 → 死模型周期性重现
 - `models.txt` 必须覆盖 `:3001` 直连全量列表；新加的名字需 2 轮才有判定，期间先显示为 suspect
-- 重建 prober 容器会清掉 `/tmp/probe_state` → 先 `docker cp` 备份、重建后立刻拷回（见上文）
+- 重建 prober 容器会清掉 `/tmp/probe_state` → 用 `deploy-prober.sh`（自动备份恢复）
+- **429 / `Concurrent request limit` 一律不判死** —— 那是并发或额度踩线，不是模型坏了
+- **PUT 健康表必须用 JSON body**，不是 query string；用错会静默丢弃（曾致 84 个判定全部丢失）
+- prober 依赖 `docker.sock`（只读挂载）来 `docker logs new-api`，缺了被动检测会失效
 
 ## License
 

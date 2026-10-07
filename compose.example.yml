@@ -38,11 +38,20 @@ services:
     environment:
       - GATEWAY_URL=http://openresty:3000
       - MODEL_LIST=/app/models.txt
-      - SLEEP=7200
+      - SLEEP=14400
+      - ONLY_BLIND=1
+      - PASSIVE_ENABLED=1
+      - LOG_LINES=12000
+      - WINDOW=86400
+      - DEAD_STREAK=2
+      - PROBE_PAUSE=2
+      - BATCH_SIZE=25
+      - BATCH_PAUSE=12
       - ADMIN_TOKEN=${ADMIN_TOKEN:-health-admin-token}
       - TOKEN=${PROBER_TOKEN:-}
     volumes:
       - ./prober/models.txt:/app/models.txt:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - sidecar
     healthcheck:
