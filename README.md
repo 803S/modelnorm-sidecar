@@ -127,9 +127,17 @@ record error log: userId=1, channelId=7, modelName=glm-5.2, tokenName=...,
 | 证据 | 判定 |
 |---|---|
 | 窗口内有成功调用 | **LIVE**（哪怕同时也有失败） |
-| 只有 429 / 限额 / quota / `Concurrent request limit` / `at most` 类 | **不动**，绝不判死 |
+| 上游明确说「没这个模型」`unknown provider` / `Invalid model` / `模型未找到` / `Invalid token` | **DEAD**（确定性失败，一次即判） |
 | 只有硬错误（400/401/403/404/410/500/502/503/504/522/524）且无成功 | 累计 ≥2 次才 **DEAD**（防抖） |
+| 只有 429 / 限额 / quota / `Concurrent request limit` / `temporarily unavailable` / 上游「反测活拦截」 | **不动，绝不判死** |
 | 超时 | UNKNOWN → 显示（fail-open） |
+
+> **别忘了全 lowercase 比对**：曾因 Python 端写大写 `DEAD`、Lua 端严格比对小写 `"dead"`，
+> 导致 **72 个死模型一个都没被过滤**（2026-10-08）。现在两端都做了小写归一化。
+
+> **反测活**：部分上游会拦截 `hi`/`你好` 这类短消息
+> （返回「短消息命中测活探针关键词」）。这**不代表模型坏了**，
+> 已归入 soft 不判死 —— 顺带说明：**不要把探活提示词写得像探针**。
 
 ### 阶段 2：主动兜底（只对盲区）
 
@@ -193,6 +201,38 @@ bash deploy-prober.sh
 
 > 注意：改 `default.conf` 不用重建，`docker cp` + `openresty -s reload` 即可（热重载会清空 shared_dict，死模型短暂重现，下轮恢复）。
 
+### 一次性清理僵尸模型
+
+有些模型 new-api 渠道里注册了名字、上游实际不支持（`unknown provider` / `Invalid model`），
+或上游长期故障返回空错误。逐个实测后可以直接标死，立即从列表消失：
+
+```bash
+for m in glm-5.1 kimi-k3 gemini-3.6-flash SenseAudio-S1; do
+  curl -s -X PUT "http://localhost:3000/__modelnorm/health?model=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$m")" \
+    -H "Authorization: Bearer health-admin-token" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$m\",\"status\":\"dead\"}"
+done
+```
+
+**注意 status 必须是小写 `dead`**（大写不会被过滤逻辑匹配）。
+
+批量验证 "放出来的模型是否真能用"：
+
+```bash
+TOKEN=sk-your-token
+curl -s "http://localhost:3000/v1/models" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json;print('\n'.join(m['id'] for m in json.load(sys.stdin)['data']))" \
+  | while read m; do
+      code=$(curl -s -o /tmp/r.json -w '%{http_code}' -X POST http://localhost:3000/v1/chat/completions \
+        -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+        -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"把数字 1 翻译成中文\"}],\"max_tokens\":8}")
+      grep -q '"choices"' /tmp/r.json && echo "OK   $m" || echo "FAIL $m ($code)"
+    done
+```
+
+提示词别用 `hi` —— 部分上游有**反测活**，会拦截短消息（不代表模型坏）。
+
 ## 设计红线
 
 1. 规则只从名字形态生成，**不依赖供应商/渠道配置**（new-api 后端变动不影响 sidecar）
@@ -224,6 +264,9 @@ bash deploy-prober.sh
 - **PUT 健康表必须用 JSON body**，不是 query string；用错会静默丢弃（曾致 84 个判定全部丢失）
 - prober 依赖 `docker.sock`（只读挂载）来 `docker logs new-api`，缺了被动检测会失效
 - **`--tail N` 的日志覆盖时长会随密度浮动**（实测 12000 行只有 ~15h）。判定窗口大于实际覆盖时会「遗忘」老结论 → 盲区虚高 → 退化回全量探测。必须配 `BLIND_GRACE` / `HEALTH_MAX_AGE` 做记忆兜底
+- **健康表 status 是全小写语义**：`"DEAD"` 不会被 `h.status == "dead"` 匹配到，写入端务必 `.lower()`
+- **Lua 里先判 nil 再取字段**：`if h and h.status:lower() == "dead"` 的写法在 `h == nil` 时会
+  `attempt to index local 'h'` 直接 500。必须写成 `if h then local st = h.status ... end`
 
 ## License
 

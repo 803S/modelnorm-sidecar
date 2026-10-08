@@ -43,11 +43,27 @@ HARD_CODES = {"400", "401", "403", "404", "410", "500", "502", "503", "504", "52
 SOFT_CODES = {"429", "509"}
 
 # 429 / 限额 / 并发类关键词：模型没坏，是额度或并发踩线
+# 上游明确说「没有这个模型」/「渠道不支持」：确定性失败，永远不可能成功
+# 例：unknown provider for model X / Invalid model: X / model_not_found
+HARD_MODEL_ERRORS = [
+    "unknown provider", "invalid model", "model_not_found", "not found",
+    "no such model", "unsupported model", "model does not exist",
+    "does not exist", "无权访问", "no available channel",
+    # 中文/兼容写法（实测遇到）
+    "模型未找到", "未找到模型", "模型不存在", "不支持的模型",
+    "invalid token", "无效的 token", "unauthorized", "forbidden",
+]
+
 SOFT_KEYWORDS = [
     "429", "rate limit", "rate_limit", "rate-limit", "too many requests",
     "quota", "insufficient_quota", "限额", "限流", "限率", "额度", "余额不足",
     "concurrent", "并发", "at most", "requests per", "rpm", "tpm",
     "no_available_channel", "超出", "insufficient balance",
+    # 上游有反测活机制：普通对话也可能命中关键词被拦，这不是模型坏了
+    "反测活", "测活探针", "probe",
+    # 临时性上游故障，不算模型死
+    "temporarily unavailable", "try again", "please retry", "稍后重试",
+    "bad gateway", "service unavailable", "upstream",
 ]
 
 NOISE_TOKENS = {
@@ -92,11 +108,25 @@ def parse_ts(s):
 
 
 def is_soft(code, content):
-    """判断错误是否属于 429/限额/并发类（不算模型坏）"""
+    """判断错误是否属于 429/限额/并发/反测活类（不算模型坏）"""
     if code in SOFT_CODES:
         return True
     low = (content or "").lower()
     for kw in SOFT_KEYWORDS:
+        if kw in low:
+            return True
+    return False
+
+
+def is_hard_model_error(content):
+    """确定性失败：上游明确说「没这个模型」，永远不可能成功 → 可直接判死。
+
+    实测发现 17 个可见模型属此类（`unknown provider for model X` /
+    `Invalid model: X`），它们是被 new-api 渠道注册了名字但上游实际不支持的
+    僵尸模型 —— 用户点一次失败一次，必须隐藏。
+    """
+    low = (content or "").lower()
+    for kw in HARD_MODEL_ERRORS:
         if kw in low:
             return True
     return False
@@ -123,7 +153,7 @@ def extract(lines):
       2. record error log    → 【权威】含 modelName + status_code + 正文
       3. GIN relay 非200     → 兜底，从上下文凑 model
     """
-    stat = defaultdict(lambda: {"ok": [], "hard": [], "soft": []})
+    stat = defaultdict(lambda: {"ok": [], "hard": [], "soft": [], "fatal": []})
     n = len(lines)
     last_ts = int(time.time())
 
@@ -153,8 +183,12 @@ def extract(lines):
             if mdl:
                 if is_soft(code, content):
                     stat[mdl]["soft"].append(ts)
-                elif code in HARD_CODES:
-                    stat[mdl]["hard"].append(ts)
+                elif is_hard_model_error(content) or code in HARD_CODES:
+                    # 确定性错误（没这个模型）或 HTTP 硬错误
+                    if is_hard_model_error(content):
+                        stat[mdl]["fatal"].append(ts)
+                    else:
+                        stat[mdl]["hard"].append(ts)
             continue
 
         # ---- 3. 兜底：GIN 非200 ----
@@ -248,7 +282,7 @@ def save_state(d):
 def put_health(model, status):
     """PUT 到 sidecar 健康表。sidecar 期望 JSON body（不是 query string！）"""
     url = f"{GATEWAY}/__modelnorm/health?model={urllib.parse.quote(model)}"
-    payload = json.dumps({"model": model, "status": status}).encode()
+    payload = json.dumps({"model": model, "status": status.lower()}).encode()
     req = urllib.request.Request(url, data=payload, method="PUT")
     req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
     req.add_header("Content-Type", "application/json")
@@ -325,14 +359,20 @@ def main():
         ok = [t for t in s["ok"] if now - t <= WINDOW]
         hard = [t for t in s["hard"] if now - t <= WINDOW]
         soft = [t for t in s["soft"] if now - t <= WINDOW]
+        fatal = [t for t in s.get("fatal", []) if now - t <= WINDOW]
 
         # 日志窗口忘了成功的、但记忆里仍新鲜的 → 视为活（防止列表突然泄露）
         if not ok and now - last_ok.get(model, 0) <= BLIND_GRACE:
             ok = [last_ok[model]]
 
+        # 确定性失败（上游明确说没这个模型）：一次就判死，不必等 DEAD_STREAK
         if ok:
             verdict = "LIVE"
             prev[model] = 0
+        elif fatal:
+            # 上游明确说没这个模型 → 直接判死，无需累计
+            verdict = "DEAD"
+            prev[model] = DEAD_STREAK
         elif hard:
             streak = prev.get(model, 0) + len(hard)
             prev[model] = streak
