@@ -28,7 +28,13 @@ LOG_LINES = int(os.environ.get("LOG_LINES", "12000"))
 WINDOW = int(os.environ.get("LIVE_WINDOW", os.environ.get("WINDOW", "86400")))  # 判定窗口 24h
 DEAD_STREAK = int(os.environ.get("DEAD_STREAK", "2"))       # 硬错误累计几次才判死
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
-STATE_FILE = "/tmp/passive_state/consecutive_hard_fail.json"
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/passive_state/consecutive_hard_fail.json")
+# 跨轮成功记忆：防止日志窗口滚动把「活过」的事实遗忘
+LAST_OK_FILE = os.environ.get("LAST_OK_FILE", "/tmp/passive_state/last_ok.json")
+# 记着它活过多久都不算盲区（默认 3 天）
+BLIND_GRACE = int(os.environ.get("BLIND_GRACE", "259200"))
+# sidecar 健康表判定新鲜度：比这更新就不必再主动探测
+HEALTH_MAX_AGE = int(os.environ.get("HEALTH_MAX_AGE", "86400"))
 
 # ---- 错误分类 ----
 # HARD: 模型/渠道本身不可用 → 可判死
@@ -182,6 +188,54 @@ def load_state():
         return {}
 
 
+def load_last_ok():
+    """跨轮记忆：每个模型最后一次成功调用的时间戳。
+
+    为什么需要：docker logs --tail N 覆盖的时间跨度随日志密度波动，
+    实测 12000 行只覆盖约 15h —— 老于 15h 的成功记录会被挤出窗口，
+    模型被误判成「盲区」→ 每轮重探 77 个（用户又会 429）。
+    持久化后：只要记得它活过，就不再当它未知。
+    """
+    try:
+        with open(LAST_OK_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_last_ok(d):
+    try:
+        os.makedirs(os.path.dirname(LAST_OK_FILE), exist_ok=True)
+        with open(LAST_OK_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print(f"[passive] last_ok 保存失败: {e}", file=sys.stderr)
+
+
+def fetch_health_ts():
+    """拉取 sidecar 健康表，返回 {model_lower: last_probe_ts}。
+
+    用于排除「sidecar 里已有新鲜判定」的模型 —— 不必再主动探测。
+    """
+    url = f"{GATEWAY}/__modelnorm/health/list"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode(errors="replace"))
+        out = {}
+        for e in data.get("entries", []):
+            key = e.get("key", "").replace("health:", "")
+            try:
+                out[key] = json.loads(e.get("val", "{}")).get("last_probe_ts", 0)
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        print(f"[passive] 健康表拉取失败（盲区会偏大）: {e}", file=sys.stderr)
+        return {}
+
+
 def save_state(d):
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -219,7 +273,25 @@ def main():
     stat = extract(lines)
     prev = load_state()
 
-    # ---- 盲区名单：models.txt 有、但日志中完全无记录 → 需主动兜底探测 ----
+    # ---- 跨轮记忆 + sidecar 新鲜度，用于压缩盲区 ----
+    last_ok = load_last_ok()
+    now0 = int(time.time())
+    health_ts = fetch_health_ts()
+    fresh_cut = now0 - HEALTH_MAX_AGE   # 健康表里比这更新的判定，视为不需要再探
+
+    # 更新 last_ok：本轮日志里观察到的成功，记下最新时间戳
+    for mdl, s in stat.items():
+        oks = [t for t in s["ok"] if t > 0]
+        if oks:
+            newest = max(oks)
+            if newest > last_ok.get(mdl, 0):
+                last_ok[mdl] = newest
+
+    # ---- 盲区名单 ----
+    # 三级过滤，避免「日志窗口遗忘」导致的虚假盲区：
+    #   ① 本轮日志里出现过       → 非盲区（被动能判定）
+    #   ② last_ok 记忆里仍新鲜   → 非盲区（记得它活过）
+    #   ③ sidecar 健康表有新鲜判定 → 非盲区（已有结论，不必再探）
     blind = []
     try:
         mt_path = os.environ.get("MODEL_LIST", "/app/models.txt")
@@ -228,11 +300,22 @@ def main():
             m = m.strip()
             if m and not m.startswith("#"):
                 full.append(m.lower())
-        blind = sorted(set(full) - set(stat.keys()))
+        for name in sorted(set(full)):
+            if name in stat:
+                continue                                   # ①
+            if now0 - last_ok.get(name, 0) <= BLIND_GRACE:  # ②
+                continue
+            ts = health_ts.get(name, 0)
+            if ts and ts >= fresh_cut:                     # ③
+                continue
+            blind.append(name)
         os.makedirs("/tmp/passive_state", exist_ok=True)
         with open("/tmp/passive_state/blind_models.txt", "w") as f:
             f.write("\n".join(blind) + ("\n" if blind else ""))
-        print(f"[passive] 被动盲区 {len(blind)} 个 → /tmp/passive_state/blind_models.txt")
+        print(f"[passive] 盲区 {len(blind)} 个"
+              f"（日志覆盖{len(stat)}/记忆{len(last_ok)}/健康表{len(health_ts)}，"
+              f"阈值 window={WINDOW}s grace={BLIND_GRACE}s sidecar_fresh={HEALTH_MAX_AGE}s）"
+              f" → /tmp/passive_state/blind_models.txt")
     except Exception as e:
         print(f"[passive] 盲区计算失败: {e}", file=sys.stderr)
 
@@ -242,6 +325,10 @@ def main():
         ok = [t for t in s["ok"] if now - t <= WINDOW]
         hard = [t for t in s["hard"] if now - t <= WINDOW]
         soft = [t for t in s["soft"] if now - t <= WINDOW]
+
+        # 日志窗口忘了成功的、但记忆里仍新鲜的 → 视为活（防止列表突然泄露）
+        if not ok and now - last_ok.get(model, 0) <= BLIND_GRACE:
+            ok = [last_ok[model]]
 
         if ok:
             verdict = "LIVE"
@@ -276,6 +363,7 @@ def main():
         print(f"  {model:42s} {v:4s} ok={o:<3d} hard={h:<3d} soft={s_:<3d}{warn}{note}")
 
     save_state(prev)
+    save_last_ok(last_ok)
     print(f"\n[passive] LIVE={counts['LIVE']} DEAD={counts['DEAD']} "
           f"(含429证据仍判活={counts['had_soft']}) 观察中={counts['skip']} 盲区={len(blind)}")
     print("[passive] 规则: 纯429/限额一律不判死 ✓")

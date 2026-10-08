@@ -44,6 +44,8 @@ services:
       - LOG_LINES=12000
       - WINDOW=86400
       - DEAD_STREAK=2
+      - BLIND_GRACE=259200
+      - HEALTH_MAX_AGE=86400
       - PROBE_PAUSE=2
       - BATCH_SIZE=25
       - BATCH_PAUSE=12
