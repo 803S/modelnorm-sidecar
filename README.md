@@ -139,6 +139,22 @@ record error log: userId=1, channelId=7, modelName=glm-5.2, tokenName=...,
 > （返回「短消息命中测活探针关键词」）。这**不代表模型坏了**，
 > 已归入 soft 不判死 —— 顺带说明：**不要把探活提示词写得像探针**。
 
+### 阶段 1.5：死模型续期（防复活）
+
+**为什么需要**：这是个反直觉的坑。死模型被过滤掉之后 → 没人调用它 →
+它不再出现在 new-api 日志里 → `extract()` 看不到它 → `put_health` 永远不会被调用
+→ sidecar 里那条 DEAD 记录 8.5h TTL 一过就消失 → **模型重新可见**。
+
+于是 DEAD 数会逐轮流失，盲区同步暴涨（实测 `123 → 80 → 67 → 36`，盲区 `2 → 74`），
+表现为「死模型周期性复活、每轮盲区重探一大堆、用户又 429」。
+
+**解法**：`last_dead.json` 持久化死模型记忆，每轮对其中**未在本轮日志出现**的模型
+重新 PUT 一次 DEAD，续上 sidecar 的 TTL。同时把它们排除出盲区，避免每轮重探。
+
+- `fatal`（上游明确说没这个模型：`unknown provider` / `Invalid model` / `模型未找到`）→ **永久死**，不受 `DEAD_GRACE` 限制
+- 普通硬错误判死 → `DEAD_GRACE`（默认 30 天）内保持死，超期后给它机会复活
+- 一旦观测到成功调用 → 立刻从 `last_dead` 抹掉
+
 ### 阶段 2：主动兜底（只对盲区）
 
 被动扫完会生成 `/tmp/passive_state/blind_models.txt`，`probe.sh` 只读这个文件去探测（默认 `ONLY_BLIND=1`）。
@@ -267,6 +283,10 @@ curl -s "http://localhost:3000/v1/models" -H "Authorization: Bearer $TOKEN" \
 - **健康表 status 是全小写语义**：`"DEAD"` 不会被 `h.status == "dead"` 匹配到，写入端务必 `.lower()`
 - **Lua 里先判 nil 再取字段**：`if h and h.status:lower() == "dead"` 的写法在 `h == nil` 时会
   `attempt to index local 'h'` 直接 500。必须写成 `if h then local st = h.status ... end`
+- **死模型必须主动续期**：死模型没人调用 → 不进日志 → 永不被重新 PUT → sidecar TTL 一过
+  标记消失 → 周期性复活（实测 DEAD 123→80→67→36，盲区涨到 74）。见「死模型复活」一节
+- **状态目录必须和被备份的目录一致**：passive 曾写到 `/tmp/passive_state`，
+  而 deploy 只备份 `/tmp/probe_state` → 每次重建记忆全丢 → 盲区暴涨需多轮自愈
 
 ## License
 

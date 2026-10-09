@@ -116,7 +116,7 @@ main() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] Starting cycle (gateway=$GATEWAY_URL)"
 
     # ========== 阶段 1：被动健康检测（零请求，只读 new-api 日志）==========
-    local blind_file="/tmp/passive_state/blind_models.txt"
+    local blind_file="/tmp/probe_state/blind_models.txt"
     if [ "${PASSIVE_ENABLED:-1}" = "1" ] && [ -f /app/passive_health.py ]; then
         echo "--- passive health scan (zero requests) ---"
         python3 /app/passive_health.py 2>&1 | tail -6 || echo "WARN: passive scan failed, falling back to blind file if exists"

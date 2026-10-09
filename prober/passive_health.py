@@ -28,9 +28,14 @@ LOG_LINES = int(os.environ.get("LOG_LINES", "12000"))
 WINDOW = int(os.environ.get("LIVE_WINDOW", os.environ.get("WINDOW", "86400")))  # 判定窗口 24h
 DEAD_STREAK = int(os.environ.get("DEAD_STREAK", "2"))       # 硬错误累计几次才判死
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/passive_state/consecutive_hard_fail.json")
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/probe_state/consecutive_hard_fail.json")
 # 跨轮成功记忆：防止日志窗口滚动把「活过」的事实遗忘
-LAST_OK_FILE = os.environ.get("LAST_OK_FILE", "/tmp/passive_state/last_ok.json")
+LAST_OK_FILE = os.environ.get("LAST_OK_FILE", "/tmp/probe_state/last_ok.json")
+# 跨轮「死过」记忆：死模型没人调用 → 不进日志 → 永不续期 → sidecar TTL 一过就复活。
+# 必须像 last_ok 一样自己记着，每轮续期，否则死模型会周期性重新可见。
+LAST_DEAD_FILE = os.environ.get("LAST_DEAD_FILE", "/tmp/probe_state/last_dead.json")
+# 死模型记忆多久内持续保持 DEAD（默认 30 天；fatal 类永久死）
+DEAD_GRACE = int(os.environ.get("DEAD_GRACE", "2592000"))
 # 记着它活过多久都不算盲区（默认 3 天）
 BLIND_GRACE = int(os.environ.get("BLIND_GRACE", "259200"))
 # sidecar 健康表判定新鲜度：比这更新就不必再主动探测
@@ -237,6 +242,38 @@ def load_last_ok():
         return {}
 
 
+def load_last_dead():
+    """跨轮记忆：{model: {"ts": 最后判死时间, "fatal": bool}}
+
+    与 last_ok 对称的问题：死模型没人调用 → 不再出现在日志里 →
+    extract() 看不到它 → put_health 永远不会被调用 → sidecar 里那条
+    DEAD 记录 TTL/新鲜度一过就消失 → 模型重新可见（DEAD 数会逐轮流失，
+    实测 123→80→67→36，盲区同步涨到 74）。
+
+    记下来之后每轮续期，死模型就不会周期性复活。
+    fatal（上游明确说没这个模型）记成永久死，不受 DEAD_GRACE 限制。
+    """
+    try:
+        with open(LAST_DEAD_FILE) as f:
+            data = json.load(f)
+        # 兼容旧格式 {model: ts}
+        out = {}
+        for k, v in data.items():
+            out[k] = v if isinstance(v, dict) else {"ts": v, "fatal": False}
+        return out
+    except Exception:
+        return {}
+
+
+def save_last_dead(d):
+    try:
+        os.makedirs(os.path.dirname(LAST_DEAD_FILE), exist_ok=True)
+        with open(LAST_DEAD_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print(f"[passive] last_dead 保存失败: {e}", file=sys.stderr)
+
+
 def save_last_ok(d):
     try:
         os.makedirs(os.path.dirname(LAST_OK_FILE), exist_ok=True)
@@ -282,7 +319,13 @@ def save_state(d):
 def put_health(model, status):
     """PUT 到 sidecar 健康表。sidecar 期望 JSON body（不是 query string！）"""
     url = f"{GATEWAY}/__modelnorm/health?model={urllib.parse.quote(model)}"
-    payload = json.dumps({"model": model, "status": status.lower()}).encode()
+    # last_probe_ts 必须写！sidecar 读取时会校验新鲜度（默认 15300s），
+    # 缺这个字段的判定会在几小时后被当作过期丢弃 → 死模型重新可见。
+    payload = json.dumps({
+        "model": model,
+        "status": status.lower(),
+        "last_probe_ts": int(time.time()),
+    }).encode()
     req = urllib.request.Request(url, data=payload, method="PUT")
     req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
     req.add_header("Content-Type", "application/json")
@@ -309,6 +352,7 @@ def main():
 
     # ---- 跨轮记忆 + sidecar 新鲜度，用于压缩盲区 ----
     last_ok = load_last_ok()
+    last_dead = load_last_dead()
     now0 = int(time.time())
     health_ts = fetch_health_ts()
     fresh_cut = now0 - HEALTH_MAX_AGE   # 健康表里比这更新的判定，视为不需要再探
@@ -320,6 +364,17 @@ def main():
             newest = max(oks)
             if newest > last_ok.get(mdl, 0):
                 last_ok[mdl] = newest
+
+    # ---- 死模型续期名单（先算集合，PUT 在判定循环之后统一执行） ----
+    # 记忆里仍算死的模型：本轮日志没出现（没人调用），但判定不能丢。
+    # 每轮重新 PUT 一次，把 sidecar 的 TTL/新鲜度续上，否则死模型会复活。
+    to_renew = []
+    for model, info in last_dead.items():
+        is_fatal = bool(info.get("fatal"))
+        age = now0 - int(info.get("ts", 0))
+        if is_fatal or age <= DEAD_GRACE:
+            to_renew.append(model)
+    renewed = 0
 
     # ---- 盲区名单 ----
     # 三级过滤，避免「日志窗口遗忘」导致的虚假盲区：
@@ -339,17 +394,23 @@ def main():
                 continue                                   # ①
             if now0 - last_ok.get(name, 0) <= BLIND_GRACE:  # ②
                 continue
+            dead = last_dead.get(name)
+            if dead:                                       # ②b 记得它死过
+                age = now0 - int(dead.get("ts", 0))
+                if dead.get("fatal") or age <= DEAD_GRACE:
+                    continue
             ts = health_ts.get(name, 0)
             if ts and ts >= fresh_cut:                     # ③
                 continue
             blind.append(name)
-        os.makedirs("/tmp/passive_state", exist_ok=True)
-        with open("/tmp/passive_state/blind_models.txt", "w") as f:
+        os.makedirs("/tmp/probe_state", exist_ok=True)
+        with open("/tmp/probe_state/blind_models.txt", "w") as f:
             f.write("\n".join(blind) + ("\n" if blind else ""))
         print(f"[passive] 盲区 {len(blind)} 个"
-              f"（日志覆盖{len(stat)}/记忆{len(last_ok)}/健康表{len(health_ts)}，"
-              f"阈值 window={WINDOW}s grace={BLIND_GRACE}s sidecar_fresh={HEALTH_MAX_AGE}s）"
-              f" → /tmp/passive_state/blind_models.txt")
+              f"（日志覆盖{len(stat)}/记忆活{len(last_ok)}/记忆死{len(last_dead)}/健康表{len(health_ts)}，"
+              f"续期死模型{renewed}，"
+              f"阈值 window={WINDOW}s grace={BLIND_GRACE}s dead_grace={DEAD_GRACE}s sidecar_fresh={HEALTH_MAX_AGE}s）"
+              f" → /tmp/probe_state/blind_models.txt")
     except Exception as e:
         print(f"[passive] 盲区计算失败: {e}", file=sys.stderr)
 
@@ -369,14 +430,18 @@ def main():
         if ok:
             verdict = "LIVE"
             prev[model] = 0
+            last_dead.pop(model, None)          # 活过 → 抹掉死记忆
         elif fatal:
-            # 上游明确说没这个模型 → 直接判死，无需累计
+            # 上游明确说没这个模型 → 直接判死，无需累计；且永久死
             verdict = "DEAD"
             prev[model] = DEAD_STREAK
+            last_dead[model] = {"ts": now, "fatal": True}
         elif hard:
             streak = prev.get(model, 0) + len(hard)
             prev[model] = streak
             verdict = "DEAD" if streak >= DEAD_STREAK else None
+            if verdict == "DEAD":
+                last_dead[model] = {"ts": now, "fatal": False}
         elif soft:
             # 纯 429/限额 → 明确不动，不判死
             verdict = None
@@ -397,6 +462,19 @@ def main():
             put = put_health(model, "LIVE" if verdict == "LIVE" else "DEAD")
         rows.append((model, verdict, len(ok), len(hard), len(soft), put))
 
+    # ---- 死模型续期：重新 PUT，续上 sidecar 的 TTL/新鲜度 ----
+    for model in sorted(to_renew):
+        if model in stat:
+            continue                                   # 本轮已判定过，跳过
+        if DRY_RUN:
+            renewed += 1
+            continue
+        if put_health(model, "DEAD"):
+            renewed += 1
+            counts["DEAD"] += 1
+        else:
+            print(f"  [续期失败] {model}", file=sys.stderr)
+
     for model, v, o, h, s_, put in rows:
         warn = "" if put else "  [PUT失败/未登记]"
         note = "  <-含429证据仍判活(不误杀)" if (s_ and v == "LIVE") else ""
@@ -404,6 +482,7 @@ def main():
 
     save_state(prev)
     save_last_ok(last_ok)
+    save_last_dead(last_dead)
     print(f"\n[passive] LIVE={counts['LIVE']} DEAD={counts['DEAD']} "
           f"(含429证据仍判活={counts['had_soft']}) 观察中={counts['skip']} 盲区={len(blind)}")
     print("[passive] 规则: 纯429/限额一律不判死 ✓")
