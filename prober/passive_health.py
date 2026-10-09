@@ -42,6 +42,8 @@ BLIND_GRACE = int(os.environ.get("BLIND_GRACE", "259200"))
 # new-api 按 UTC+8 打印，容器是 UTC，故默认 8*3600。
 # 若两者时区统一，设为 0 即可。
 LOG_TZ_OFFSET = int(os.environ.get("LOG_TZ_OFFSET", "28800"))
+# 探活用的网关 token（docker-compose 里叫 TOKEN）
+PROBE_TOKEN = os.environ.get("TOKEN", os.environ.get("PROBE_TOKEN", ""))
 # sidecar 健康表判定新鲜度：比这更新就不必再主动探测
 HEALTH_MAX_AGE = int(os.environ.get("HEALTH_MAX_AGE", "86400"))
 
@@ -330,6 +332,25 @@ def fetch_health_ts():
         return {}
 
 
+def fetch_visible_models():
+    """拉取网关 /v1/models 当前实际可见的模型 id。
+
+    为什么需要：models.txt 是静态名单，会和上游实际支持列表漂移。
+    实测有 22 个可见模型不在 models.txt 里 —— 它们永远进不了盲区，
+    于是永不被主动探测、永不被判死，一直挂在列表里占位置。
+    """
+    url = f"{GATEWAY}/v1/models"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {PROBE_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode(errors="replace"))
+        return [m.get("id", "") for m in data.get("data", [])]
+    except Exception as e:
+        print(f"[passive] /v1/models 拉取失败: {e}", file=sys.stderr)
+        return []
+
+
 def save_state(d):
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -381,12 +402,22 @@ def main():
     fresh_cut = now0 - HEALTH_MAX_AGE   # 健康表里比这更新的判定，视为不需要再探
 
     # 更新 last_ok：本轮日志里观察到的成功，记下最新时间戳
-    for mdl, s in stat.items():
-        oks = [t for t in s["ok"] if t > 0]
-        if oks:
-            newest = max(oks)
-            if newest > last_ok.get(mdl, 0):
-                last_ok[mdl] = newest
+    # 防御：未来时间戳说明时区解析错了（见 parse_ts 注释），会让所有
+    # now - ts 比较静默失效。宁可丢弃本轮数据并告警，也不要污染记忆。
+    future = [t for _, oks in ((m, [x for x in s["ok"] if x > 0]) for m, s in stat.items())
+              for t in oks if t > now0]
+    if future:
+        print(f"[passive] ⚠️ 检测到 {len(future)} 个未来时间戳"
+              f"（超前最多 {max(future) - now0}s）——日志时区解析可能有误，"
+              f"请检查 LOG_TZ_OFFSET（当前 {LOG_TZ_OFFSET}）。本轮不更新成功记忆。",
+              file=sys.stderr)
+    else:
+        for mdl, s in stat.items():
+            oks = [t for t in s["ok"] if t > 0]
+            if oks:
+                newest = max(oks)
+                if newest > last_ok.get(mdl, 0):
+                    last_ok[mdl] = newest
 
     # ---- 死模型续期名单（先算集合，PUT 在判定循环之后统一执行） ----
     # 记忆里仍算死的模型：本轮日志没出现（没人调用），但判定不能丢。
@@ -412,6 +443,16 @@ def main():
             m = m.strip()
             if m and not m.startswith("#"):
                 full.append(m.lower())
+        # 基准名单必须以「网关实际可见的模型」为准，不能只看本地 models.txt。
+        # models.txt 会和上游实际支持列表漂移（实测 22 个可见模型不在其中），
+        # 这些模型永远进不了盲区 → 永不被主动探测 → 永不被判死 → 一直挂着。
+        try:
+            for m in fetch_visible_models():
+                if m:
+                    full.append(m.lower())
+        except Exception as e:
+            print(f"[passive] 可见模型拉取失败（沿用 models.txt）: {e}",
+                  file=sys.stderr)
         for name in sorted(set(full)):
             if name in stat:
                 continue                                   # ①
