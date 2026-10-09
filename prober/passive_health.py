@@ -38,6 +38,10 @@ LAST_DEAD_FILE = os.environ.get("LAST_DEAD_FILE", "/tmp/probe_state/last_dead.js
 DEAD_GRACE = int(os.environ.get("DEAD_GRACE", "2592000"))
 # 记着它活过多久都不算盲区（默认 3 天）
 BLIND_GRACE = int(os.environ.get("BLIND_GRACE", "259200"))
+# new-api 日志打印所用时区相对容器本地时区(UTC)的偏移秒数。
+# new-api 按 UTC+8 打印，容器是 UTC，故默认 8*3600。
+# 若两者时区统一，设为 0 即可。
+LOG_TZ_OFFSET = int(os.environ.get("LOG_TZ_OFFSET", "28800"))
 # sidecar 健康表判定新鲜度：比这更新就不必再主动探测
 HEALTH_MAX_AGE = int(os.environ.get("HEALTH_MAX_AGE", "86400"))
 
@@ -106,10 +110,23 @@ NOW_RE = re.compile(r"^\[(?:INFO|WARN|ERROR|GIN)\]\s+(\d{4}/\d{2}/\d{2} - \d{2}:
 
 
 def parse_ts(s):
+    """解析 new-api 日志时间戳。
+
+    坑：new-api 日志按 UTC+8 打印（20:35），而 prober 容器本地时区是 UTC（12:35）。
+    time.mktime 会按「本地时区」解释这串数字，于是解析结果比真实时间超前 8 小时。
+
+    后果是致命的：未来时间戳让 `now - last_ok[m]` 变成负数，
+    永远满足 `<= BLIND_GRACE` → 这些模型永久被当成「我记得它活过」
+    → 永不进盲区、永不被重探、永不判死 → 坏模型一直挂在列表里。
+    （实测 46 条 last_ok 里有 36 条是未来时间戳。）
+
+    所以这里必须减掉偏移，把日志时间归一到 UTC epoch。
+    """
     try:
-        return int(time.mktime(time.strptime(s, "%Y/%m/%d - %H:%M:%S")))
+        ts = int(time.mktime(time.strptime(s, "%Y/%m/%d - %H:%M:%S")))
     except Exception:
         return 0
+    return ts - LOG_TZ_OFFSET
 
 
 def is_soft(code, content):
@@ -298,9 +315,15 @@ def fetch_health_ts():
         for e in data.get("entries", []):
             key = e.get("key", "").replace("health:", "")
             try:
-                out[key] = json.loads(e.get("val", "{}")).get("last_probe_ts", 0)
+                v = json.loads(e.get("val", "{}"))
             except Exception:
-                pass
+                continue
+            st = (v.get("status") or "").lower()
+            # 只有明确结论（dead/live）才算「不必再探」。
+            # suspect/unknown 是没有结论的状态，必须继续探 —— 否则这些模型
+            # 会被永久排除在盲区之外，永远不被主动探测，也就永远不能定性。
+            if st in ("dead", "live"):
+                out[key] = v.get("last_probe_ts", 0)
         return out
     except Exception as e:
         print(f"[passive] 健康表拉取失败（盲区会偏大）: {e}", file=sys.stderr)

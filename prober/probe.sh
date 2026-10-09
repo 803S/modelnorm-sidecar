@@ -98,7 +98,10 @@ write_health() {
     case "$verdict" in
         LIVE)    status="suspect";;   # 活，但按原约定记 suspect（不过滤）
         DEAD)    [ "$prev" = "DEAD" ] && status="dead" || status="suspect";;
-        UNKNOWN) status="unknown";;
+        # 超时/空响应（上游挂起）：单轮不判死防抖动，连续 2 轮判死。
+        # 与 429 不同 —— 429 是「稍后再来」，上游挂起对用户体验就是「不能用」，
+        # 且这类模型根本不会进 new-api 的错误日志，被动检测永远看不到它们。
+        UNKNOWN) [ "$prev" = "UNKNOWN" ] && status="dead" || status="unknown";;
         *)       status="unknown";;
     esac
 
