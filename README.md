@@ -287,6 +287,13 @@ curl -s "http://localhost:3000/v1/models" -H "Authorization: Bearer $TOKEN" \
   标记消失 → 周期性复活（实测 DEAD 123→80→67→36，盲区涨到 74）。见「死模型复活」一节
 - **状态目录必须和被备份的目录一致**：passive 曾写到 `/tmp/passive_state`，
   而 deploy 只备份 `/tmp/probe_state` → 每次重建记忆全丢 → 盲区暴涨需多轮自愈
+- **日志时区**：new-api 按 UTC+8 打印，容器是 UTC，`mktime` 会解析出**未来时间戳**，
+  让所有 `now - ts` 比较静默失效。用 `LOG_TZ_OFFSET`（默认 28800）校正
+- **标死要用真实 id，不是显示名**：`/v1/models` 显示的是 `MN_SYNTH_REWRITE` 改写的合成名
+  （`claude-opus-4-5` → 真实 `claude-opus-4-5-20251101`）。过滤检查的是真实 id，
+  按显示名标 dead 完全无效
+- **「慢」≠「死」**：15s 超时的模型可能只是响应慢（实测 grok-4.6 在 60s 下正常）。
+  判死前要用长超时复测，否则会误杀可用模型
 
 ## License
 
