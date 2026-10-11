@@ -96,7 +96,7 @@ write_health() {
 
     local status
     case "$verdict" in
-        LIVE)    status="suspect";;   # 活，但按原约定记 suspect（不过滤）
+        LIVE)    status="live";;      # 活就是活（原写 suspect，导致活模型被当可疑、死模型降级后无法区分）
         DEAD)    [ "$prev" = "DEAD" ] && status="dead" || status="suspect";;
         # 超时/空响应（上游挂起）：单轮不判死防抖动，连续 2 轮判死。
         # 与 429 不同 —— 429 是「稍后再来」，上游挂起对用户体验就是「不能用」，

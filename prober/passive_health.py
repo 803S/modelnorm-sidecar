@@ -34,6 +34,8 @@ LAST_OK_FILE = os.environ.get("LAST_OK_FILE", "/tmp/probe_state/last_ok.json")
 # 跨轮「死过」记忆：死模型没人调用 → 不进日志 → 永不续期 → sidecar TTL 一过就复活。
 # 必须像 last_ok 一样自己记着，每轮续期，否则死模型会周期性重新可见。
 LAST_DEAD_FILE = os.environ.get("LAST_DEAD_FILE", "/tmp/probe_state/last_dead.json")
+HEALTH_SNAPSHOT_FILE = os.environ.get("HEALTH_SNAPSHOT_FILE",
+                                      "/tmp/probe_state/health_snapshot.json")
 # 死模型记忆多久内持续保持 DEAD（默认 30 天；fatal 类永久死）
 DEAD_GRACE = int(os.environ.get("DEAD_GRACE", "2592000"))
 # 记着它活过多久都不算盲区（默认 3 天）
@@ -293,6 +295,63 @@ def save_last_dead(d):
         print(f"[passive] last_dead 保存失败: {e}", file=sys.stderr)
 
 
+def save_health_snapshot():
+    """把 sidecar 健康表全量落盘。
+
+    ngx.shared.model_health 是纯内存字典 —— openresty 重启/重建会清零，
+    导致所有 dead 标记丢失、坏模型全部复活可见（实测 99 → 204）。
+    每轮探测快照一次，供启动时恢复。
+    """
+    try:
+        entries = fetch_health_entries()
+    except Exception as e:
+        print(f"[passive] health 快照拉取失败: {e}", file=sys.stderr)
+        return
+    if not entries:
+        return
+    snap = {e.get("key", "").replace("health:", ""): e.get("val", "")
+            for e in entries if e.get("key")}
+    try:
+        os.makedirs(os.path.dirname(HEALTH_SNAPSHOT_FILE), exist_ok=True)
+        with open(HEALTH_SNAPSHOT_FILE, "w") as f:
+            json.dump({"ts": int(time.time()), "entries": snap}, f)
+        print(f"[passive] health 快照已存 {len(snap)} 条")
+    except Exception as e:
+        print(f"[passive] health 快照保存失败: {e}", file=sys.stderr)
+
+
+def restore_health_snapshot():
+    """容器启动后把快照写回 sidecar，避免重启即失忆。
+
+    只恢复「还没过期」的判定：超过 freshness 窗口的记录已不可信，跳过。
+    """
+    try:
+        with open(HEALTH_SNAPSHOT_FILE) as f:
+            d = json.load(f)
+    except Exception:
+        return 0
+    entries = d.get("entries") or {}
+    now = int(time.time())
+    ok = 0
+    for key, val in entries.items():
+        try:
+            v = json.loads(val)
+        except Exception:
+            continue
+        ts = v.get("last_probe_ts") or 0
+        # 与 openresty mn_health_get 的 20700s 新鲜度窗口保持一致
+        if ts and now - ts > 20700:
+            continue
+        st = (v.get("status") or "").lower()
+        if st not in ("dead", "live", "suspect", "unknown"):
+            continue
+        if put_health(key, st, ts=ts):
+            ok += 1
+    if ok:
+        print(f"[passive] 从快照恢复 {ok} 条健康记录")
+    return ok
+
+
 def save_last_ok(d):
     try:
         os.makedirs(os.path.dirname(LAST_OK_FILE), exist_ok=True)
@@ -302,19 +361,25 @@ def save_last_ok(d):
         print(f"[passive] last_ok 保存失败: {e}", file=sys.stderr)
 
 
+def fetch_health_entries():
+    """拉取 sidecar 健康表原始 entries（[{key, val}]）。"""
+    url = f"{GATEWAY}/__modelnorm/health/list"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode(errors="replace"))
+    return data.get("entries", [])
+
+
 def fetch_health_ts():
     """拉取 sidecar 健康表，返回 {model_lower: last_probe_ts}。
 
     用于排除「sidecar 里已有新鲜判定」的模型 —— 不必再主动探测。
     """
-    url = f"{GATEWAY}/__modelnorm/health/list"
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
+    entries = fetch_health_entries()
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode(errors="replace"))
         out = {}
-        for e in data.get("entries", []):
+        for e in entries:
             key = e.get("key", "").replace("health:", "")
             try:
                 v = json.loads(e.get("val", "{}"))
@@ -360,15 +425,19 @@ def save_state(d):
         print(f"[passive] state 保存失败: {e}", file=sys.stderr)
 
 
-def put_health(model, status):
-    """PUT 到 sidecar 健康表。sidecar 期望 JSON body（不是 query string！）"""
+def put_health(model, status, ts=None):
+    """PUT 到 sidecar 健康表。sidecar 期望 JSON body（不是 query string！）
+
+    ts: 可选，指定 last_probe_ts（快照恢复时要用原时间戳，不能用当前时间，
+        否则会把一条过期记录伪装成新鲜的）。
+    """
     url = f"{GATEWAY}/__modelnorm/health?model={urllib.parse.quote(model)}"
-    # last_probe_ts 必须写！sidecar 读取时会校验新鲜度（默认 15300s），
+    # last_probe_ts 必须写！sidecar 读取时会校验新鲜度（默认 20700s），
     # 缺这个字段的判定会在几小时后被当作过期丢弃 → 死模型重新可见。
     payload = json.dumps({
         "model": model,
         "status": status.lower(),
-        "last_probe_ts": int(time.time()),
+        "last_probe_ts": int(ts if ts is not None else time.time()),
     }).encode()
     req = urllib.request.Request(url, data=payload, method="PUT")
     req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
@@ -385,6 +454,12 @@ def put_health(model, status):
 
 def main():
     now = int(time.time())
+    # openresty 重启会清空 ngx.shared.model_health（纯内存），
+    # 导致 dead 标记全丢、坏模型复活。启动时先从快照恢复。
+    try:
+        restore_health_snapshot()
+    except Exception as e:
+        print(f"[passive] 快照恢复异常: {e}", file=sys.stderr)
     lines = run_docker_logs(LOG_LINES)
     if not lines:
         print("[passive] 无日志", file=sys.stderr)
@@ -547,6 +622,7 @@ def main():
     save_state(prev)
     save_last_ok(last_ok)
     save_last_dead(last_dead)
+    save_health_snapshot()
     print(f"\n[passive] LIVE={counts['LIVE']} DEAD={counts['DEAD']} "
           f"(含429证据仍判活={counts['had_soft']}) 观察中={counts['skip']} 盲区={len(blind)}")
     print("[passive] 规则: 纯429/限额一律不判死 ✓")
